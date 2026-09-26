@@ -1,0 +1,106 @@
+name: Build and publish releases
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    name: Build Linux x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build archive
+        run: |
+          mkdir -p dist/linux
+          cc -std=c11 -O2 -Wall -Wextra -Wpedantic -o dist/linux/bpm bpm.c -lm
+          cp README.md dist/linux/README.md
+          tar -czf dist/bpm-linux-x64.tar.gz -C dist/linux bpm README.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bpm-linux-release-asset
+          path: dist/bpm-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  build-windows:
+    name: Build Windows x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install MinGW-w64
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes gcc-mingw-w64-x86-64 zip
+
+      - name: Build archive
+        run: |
+          mkdir -p dist/windows
+          x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic \
+            -o dist/windows/bpm.exe bpm.c -lm -lwinmm
+          cp README.md dist/windows/README.md
+          (cd dist/windows && zip -9 ../bpm-windows-x64.zip bpm.exe README.md)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bpm-windows-release-asset
+          path: dist/bpm-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 1
+
+  build-macos:
+    name: Build macOS universal
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Build archive
+        run: |
+          mkdir -p dist/macos
+          clang -std=c11 -O2 -Wall -Wextra -Wpedantic \
+            -arch arm64 -arch x86_64 -o dist/macos/bpm bpm.c -lm
+          cp README.md dist/macos/README.md
+          tar -czf dist/bpm-macos-universal.tar.gz -C dist/macos bpm README.md
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: bpm-macos-release-asset
+          path: dist/bpm-macos-universal.tar.gz
+          if-no-files-found: error
+          retention-days: 1
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: bpm-*-release-asset
+          path: release-assets
+          merge-multiple: true
+
+      - name: Publish release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          GH_SHA: ${{ github.sha }}
+          GH_RUN_ID: ${{ github.run_id }}
+          GH_RUN_NUMBER: ${{ github.run_number }}
+          GH_RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          tag="build-${GH_RUN_ID}-${GH_RUN_ATTEMPT}"
+          gh release create "$tag" release-assets/bpm-* \
+            --repo "$GH_REPOSITORY" \
+            --title "BPM build ${GH_RUN_NUMBER}" \
+            --notes "Automated cross-platform build for commit ${GH_SHA}." \
+            --target "$GH_SHA" \
+            --latest

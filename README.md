@@ -24,6 +24,8 @@ No third-party library is needed to build. Supported PCM WAV files can be analyz
 
 On Windows, `package.bat` builds `dist/bpm-windows-x64.zip` containing `bpm.exe` and this README. It requires GCC (MinGW-w64 or MSYS2) and PowerShell, both available on standard Windows development setups.
 
+Every push also runs the GitHub Actions workflow and publishes a release with `bpm-windows-x64.zip`, `bpm-linux-x64.tar.gz`, and the universal `bpm-macos-universal.tar.gz`. The release contains the `bpm` executable (named `bpm.exe` on Windows) and this README.
+
 TUI playback uses the Windows audio API on Windows, the built-in `afplay` command on macOS, and `ffplay` or `aplay` on Linux. Playback on macOS/Linux requires the corresponding player to be available on `PATH`. The macOS/Linux playhead uses elapsed time and may differ slightly from the player's actual output during startup.
 
 ## Command-line usage
