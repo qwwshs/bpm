@@ -74,8 +74,7 @@ static const double BIQUAD[3][16][5] = {
 };
 
 typedef struct {
-    double start, end, bpm, offset;
-    int complete, measured;
+    double start, end;
 } MeasureRange;
 
 static uint16_t u16le(const unsigned char *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
@@ -251,18 +250,20 @@ static int coefficient_bank(unsigned rate) {
 }
 
 static void run_biquads(float *x, size_t n, int bank, unsigned first, unsigned count) {
-    unsigned s;
-    for (s = 0; s < count; ++s) {
-        const double *c = BIQUAD[bank][first + s];
+    unsigned stage;
+    for (stage = 0; stage < count; ++stage) {
+        const double *coefficient = BIQUAD[bank][first + stage];
         /* Stored denominator coefficients have their sign bit complemented. */
-        float b0=(float)c[0], b1=(float)c[1], a1=-(float)c[2], a2=-(float)c[3], b2=(float)c[4];
-        float state1=0.0f, state2=0.0f;
+        float b0 = (float)coefficient[0], b1 = (float)coefficient[1];
+        float a1 = -(float)coefficient[2], a2 = -(float)coefficient[3];
+        float b2 = (float)coefficient[4], state1 = 0.0f, state2 = 0.0f;
         size_t i;
-        for (i=0; i<n; ++i) {
+        for (i = 0; i < n; ++i) {
             float v = x[i];
-            float state = state1*a1 + b2*v + state2*a2;
-            x[i] = state1*b0 + state + state2*b1;
-            state2=state1; state1=state;
+            float state = state1 * a1 + b2 * v + state2 * a2;
+            x[i] = state1 * b0 + state + state2 * b1;
+            state2 = state1;
+            state1 = state;
         }
     }
 }
@@ -273,189 +274,332 @@ static unsigned float_histogram_bin(float value) {
     return (unsigned)((bits.u + 0x40000u) >> 19);
 }
 
-/* Port of Convert_Audio_Samples' four band filters, median thresholding,
-   weighted accumulation, 1 kHz reduction, and final smoothing. */
-static double *make_envelope(const Wave *w, size_t *out_n, double *offset_ms) {
-    static const unsigned starts[4] = {0,2,6,10}, counts[4] = {2,4,4,2};
-    static const int shifts[4] = {-320,-64,-32,0};
-    static const float weights[4] = {.3f,.2f,.2f,.3f};
-    unsigned bytes=w->bits/8;
-    size_t frames=w->size/(bytes*w->channels), nms=(frames*1000u+w->rate-1u)/w->rate;
-    int bank=coefficient_bank(w->rate);
-    float *mono, *band, *score;
-    double *rms, *env;
-    size_t i,k;
-    double raw_peak=0.0;
-    if (bank < 0 || frames < 2000 || nms < 2000) return NULL;
-    mono=(float*)malloc(frames*sizeof(float)); band=(float*)malloc(frames*sizeof(float));
-    score=(float*)calloc(frames,sizeof(float)); rms=(double*)calloc(nms,sizeof(double));
-    env=(double*)calloc(nms,sizeof(double));
-    if(!mono||!band||!score||!rms||!env) { free(mono);free(band);free(score);free(rms);free(env);return NULL; }
-    for(i=0;i<frames;++i) {
-        double v=0.0;
-        for(k=0;k<w->channels;++k) v+=sample_at(w->data+(i*w->channels+k)*bytes,w->format,w->bits);
-        mono[i]=(float)(v/w->channels);
-        k=i*1000u/w->rate;
-        if(k<nms) rms[k]+=(double)mono[i]*mono[i];
-    }
-    for(k=0;k<nms;++k) {
-        size_t f0=k*w->rate/1000u,f1=(k+1)*w->rate/1000u,count=f1>f0?f1-f0:1;
-        rms[k]=sqrt(rms[k]/count); if(rms[k]>raw_peak)raw_peak=rms[k];
-    }
-    if(raw_peak<=1e-9) { free(mono);free(band);free(score);free(rms);free(env);return NULL; }
-    *offset_ms=0.0;
-    for(k=0;k<nms;++k)if(rms[k]>raw_peak*.02){*offset_ms=(double)k;break;}
+/* Decode once, retaining the 1 ms RMS values only until offset is known. */
+static float *decode_mono(const Wave *wave, size_t frames, size_t milliseconds,
+                          double *offset_ms) {
+    const unsigned bytes_per_sample = wave->bits / 8;
+    float *mono = (float *)malloc(frames * sizeof(float));
+    double *rms = (double *)calloc(milliseconds, sizeof(double));
+    double peak = 0.0;
+    size_t frame, ms;
+    if (!mono || !rms) { free(mono); free(rms); return NULL; }
 
-    for(unsigned b=0;b<4;++b) {
-        uint32_t hist[4097]={0};
-        unsigned median=0;
-        double cumulative=0.0;
-        memcpy(band,mono,frames*sizeof(float));
-        run_biquads(band,frames,bank,starts[b],counts[b]);
-        for(i=0;i<frames;++i)band[i]*=band[i];
-        if(b==0)run_biquads(band,frames,bank,12,1);
-        for(i=0;i<frames;++i){unsigned h=float_histogram_bin(band[i]);if(h>4096)h=4096;++hist[h];}
-        for(median=0;median<4096 && cumulative<(double)(frames>>1);++median)cumulative+=hist[median];
-        if(median>4096)median=4096;
-        { uint32_t raw=median<<19; float threshold; float scale,weight;
-          memcpy(&threshold,&raw,sizeof(threshold));
-          if(!(threshold>0.0f))threshold=1e-30f;
-          scale=2.0f/threshold; weight=weights[b]*8.262958317573066e-8f;
-          for(i=0;i<frames;++i){
-              size_t advance=(size_t)(shifts[b]<0?-shifts[b]:0);
-              size_t src=i+advance;
-              if(src>=frames)continue;
-              { float q=(float)((int)(band[src]*scale+1.0f)-1); score[i]+=q*weight; }
-          }
+    for (frame = 0; frame < frames; ++frame) {
+        double value = 0.0;
+        unsigned channel;
+        for (channel = 0; channel < wave->channels; ++channel) {
+            size_t index = (frame * wave->channels + channel) * bytes_per_sample;
+            value += sample_at(wave->data + index, wave->format, wave->bits);
         }
+        mono[frame] = (float)(value / wave->channels);
+        ms = frame * 1000u / wave->rate;
+        if (ms < milliseconds) rms[ms] += (double)mono[frame] * mono[frame];
     }
-    run_biquads(score,frames,bank,13,2);
-    /* Native code picks the nearest source sample at each millisecond. */
-    for(k=0;k<nms;++k){size_t src=(size_t)llround((double)k*w->rate/1000.0); if(src<frames)env[k]=score[src];}
-    {
-      float *forward=(float*)malloc(nms*sizeof(float));
-      float *reverse=(float*)malloc(nms*sizeof(float));
-      double *difference=(double*)calloc(nms,sizeof(double));
-      if(!forward||!reverse||!difference){free(forward);free(reverse);free(difference);free(mono);free(band);free(score);free(rms);free(env);return NULL;}
-      for(k=0;k<nms;++k){forward[k]=(float)env[k];reverse[k]=(float)env[nms-1-k];}
-      run_biquads(forward,nms,bank,15,1); run_biquads(reverse,nms,bank,15,1);
-      if(nms>1){
-          difference[nms-1]=-forward[nms-2];
-          for(k=1;k<nms-1;++k)difference[k]=(double)reverse[nms-2-k]-forward[k-1];
-          difference[0]=reverse[nms-2];
-      }
-      memcpy(env,difference,nms*sizeof(double));
-      free(forward);free(reverse);free(difference);
+    for (ms = 0; ms < milliseconds; ++ms) {
+        size_t first = ms * wave->rate / 1000u;
+        size_t last = (ms + 1) * wave->rate / 1000u;
+        size_t count = last > first ? last - first : 1;
+        rms[ms] = sqrt(rms[ms] / count);
+        if (rms[ms] > peak) peak = rms[ms];
     }
-    { double mean=0.0; for(k=0;k<nms;++k)mean+=env[k]; mean/=nms; for(k=0;k<nms;++k)env[k]-=mean; }
-    free(mono);free(band);free(score);free(rms);*out_n=nms;return env;
+    if (peak <= 1e-9) { free(mono); free(rms); return NULL; }
+    *offset_ms = 0.0;
+    for (ms = 0; ms < milliseconds; ++ms) {
+        if (rms[ms] > peak * 0.02) { *offset_ms = (double)ms; break; }
+    }
+    free(rms);
+    return mono;
 }
 
-static double fit_peak_period(const double *env, size_t n, double initial_period,
+/* Port of the four native frequency bands and their median thresholds. */
+static void accumulate_band_scores(const float *mono, float *band, float *score,
+                                   size_t frames, int bank) {
+    static const unsigned starts[4] = {0, 2, 6, 10};
+    static const unsigned counts[4] = {2, 4, 4, 2};
+    static const int shifts[4] = {-320, -64, -32, 0};
+    static const float weights[4] = {0.3f, 0.2f, 0.2f, 0.3f};
+    unsigned frequency_band;
+
+    for (frequency_band = 0; frequency_band < 4; ++frequency_band) {
+        uint32_t histogram[4097] = {0};
+        unsigned median;
+        double cumulative = 0.0;
+        float threshold, scale, weight;
+        uint32_t raw;
+        size_t frame, advance = shifts[frequency_band] < 0 ?
+                                (size_t)-shifts[frequency_band] : 0;
+
+        memcpy(band, mono, frames * sizeof(float));
+        run_biquads(band, frames, bank, starts[frequency_band], counts[frequency_band]);
+        for (frame = 0; frame < frames; ++frame) band[frame] *= band[frame];
+        if (frequency_band == 0) run_biquads(band, frames, bank, 12, 1);
+        for (frame = 0; frame < frames; ++frame) {
+            unsigned bin = float_histogram_bin(band[frame]);
+            if (bin > 4096) bin = 4096;
+            ++histogram[bin];
+        }
+        for (median = 0; median < 4096 && cumulative < (double)(frames >> 1); ++median)
+            cumulative += histogram[median];
+
+        raw = median << 19;
+        memcpy(&threshold, &raw, sizeof(threshold));
+        if (!(threshold > 0.0f)) threshold = 1e-30f;
+        scale = 2.0f / threshold;
+        weight = weights[frequency_band] * 8.262958317573066e-8f;
+        for (frame = 0; frame < frames; ++frame) {
+            size_t source = frame + advance;
+            float quantized;
+            if (source >= frames) continue;
+            quantized = (float)((int)(band[source] * scale + 1.0f) - 1);
+            score[frame] += quantized * weight;
+        }
+    }
+}
+
+static int smooth_envelope(double *envelope, size_t milliseconds, int bank) {
+    float *forward = (float *)malloc(milliseconds * sizeof(float));
+    float *reverse = (float *)malloc(milliseconds * sizeof(float));
+    double mean = 0.0;
+    size_t ms;
+    if (!forward || !reverse) { free(forward); free(reverse); return 0; }
+    for (ms = 0; ms < milliseconds; ++ms) {
+        forward[ms] = (float)envelope[ms];
+        reverse[ms] = (float)envelope[milliseconds - 1 - ms];
+    }
+    run_biquads(forward, milliseconds, bank, 15, 1);
+    run_biquads(reverse, milliseconds, bank, 15, 1);
+    envelope[milliseconds - 1] = -forward[milliseconds - 2];
+    for (ms = 1; ms < milliseconds - 1; ++ms)
+        envelope[ms] = (double)reverse[milliseconds - 2 - ms] - forward[ms - 1];
+    envelope[0] = reverse[milliseconds - 2];
+    free(forward);
+    free(reverse);
+
+    for (ms = 0; ms < milliseconds; ++ms) mean += envelope[ms];
+    mean /= milliseconds;
+    for (ms = 0; ms < milliseconds; ++ms) envelope[ms] -= mean;
+    return 1;
+}
+
+/* Native signal path: frequency bands, 1 kHz sampling, then smoothing. */
+static double *make_envelope(const Wave *wave, size_t *out_n, double *offset_ms) {
+    const unsigned bytes_per_frame = (wave->bits / 8) * wave->channels;
+    const size_t frames = wave->size / bytes_per_frame;
+    const size_t milliseconds = (frames * 1000u + wave->rate - 1u) / wave->rate;
+    const int bank = coefficient_bank(wave->rate);
+    float *mono, *band, *score;
+    double *envelope;
+    size_t ms;
+    if (bank < 0 || frames < 2000 || milliseconds < 2000) return NULL;
+
+    mono = decode_mono(wave, frames, milliseconds, offset_ms);
+    if (!mono) return NULL;
+    band = (float *)malloc(frames * sizeof(float));
+    score = (float *)calloc(frames, sizeof(float));
+    envelope = (double *)calloc(milliseconds, sizeof(double));
+    if (!band || !score || !envelope) {
+        free(mono); free(band); free(score); free(envelope);
+        return NULL;
+    }
+
+    accumulate_band_scores(mono, band, score, frames, bank);
+    free(mono);
+    free(band);
+    run_biquads(score, frames, bank, 13, 2);
+    /* The native code picks the nearest source sample at each millisecond. */
+    for (ms = 0; ms < milliseconds; ++ms) {
+        size_t source = (size_t)llround((double)ms * wave->rate / 1000.0);
+        if (source < frames) envelope[ms] = score[source];
+    }
+    free(score);
+    if (!smooth_envelope(envelope, milliseconds, bank)) { free(envelope); return NULL; }
+    *out_n = milliseconds;
+    return envelope;
+}
+
+static size_t local_envelope_peak(const double *envelope, size_t n, size_t center) {
+    size_t first = center > 10 ? center - 10 : 0;
+    size_t last = center + 10 < n ? center + 10 : n - 1;
+    size_t index, best = first;
+    for (index = first + 1; index <= last; ++index)
+        if (envelope[index] > envelope[best]) best = index;
+    return best;
+}
+
+static double fit_peak_period(const double *envelope, size_t n, double initial_period,
                               double *residual_ms, double *relative_period_error) {
-    size_t period = (size_t)llround(initial_period), phase, k;
-    double best_score = -1.0, best_phase = 0.0;
+    size_t period = (size_t)llround(initial_period);
+    size_t phase, best_phase = 0, beat, count = 0;
+    double best_score = -1.0;
     double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0, syy = 0.0;
-    size_t count = 0;
+    double centered_xx, centered_xy, centered_yy, slope, sse, sigma, slope_error;
+
     if (period < 200 || period > 2000) return initial_period;
-    /* Native code aligns a beat grid to local maxima in a +/-10 ms window. */
+    /* Align the beat grid to maxima within +/-10 ms, matching the native code. */
     for (phase = 0; phase < period; ++phase) {
         double score = 0.0;
-        for (k = phase; k < n; k += period) {
-            size_t lo = k > 10 ? k - 10 : 0, hi = k + 10 < n ? k + 10 : n - 1, j, best = lo;
-            for (j = lo + 1; j <= hi; ++j) if (env[j] > env[best]) best = j;
-            score += env[best];
-        }
-        if (score > best_score) { best_score = score; best_phase = (double)phase; }
+        for (beat = phase; beat < n; beat += period)
+            score += envelope[local_envelope_peak(envelope, n, beat)];
+        if (score > best_score) { best_score = score; best_phase = phase; }
     }
-    for (k = 0; best_phase + k * period < n; ++k) {
-        double center = best_phase + k * period;
-        size_t lo = center > 10 ? (size_t)center - 10 : 0;
-        size_t hi = (size_t)center + 10 < n ? (size_t)center + 10 : n - 1, j, best = lo;
-        for (j = lo + 1; j <= hi; ++j) if (env[j] > env[best]) best = j;
-        if (env[best] > 0.0) {
-            double x = (double)k, y = (double)best;
-            sx += x; sy += y; sxx += x * x; sxy += x * y; syy += y * y; ++count;
-        }
-    }
-    if (count < 4 || count * sxx <= sx * sx) {
-        if (residual_ms) *residual_ms=1e9;
-        if (relative_period_error) *relative_period_error=1.0;
-        return initial_period;
-    }
-    {
-        double sxx_centered=sxx-sx*sx/count, sxy_centered=sxy-sx*sy/count;
-        double syy_centered=syy-sy*sy/count;
-        double slope=sxy_centered/sxx_centered;
-        double intercept=(sy-slope*sx)/count;
-        double sse=syy_centered-sxy_centered*sxy_centered/sxx_centered;
-        double sigma=sqrt(fmax(0.0,sse)/(count-2));
-        double slope_se=sigma/sqrt(sxx_centered);
-        if(residual_ms)*residual_ms=sqrt(fmax(0.0,sse)/(count-1));
-        if(relative_period_error)*relative_period_error=slope>0.0?slope_se/slope:1.0;
-        (void)intercept;
-        return slope>0.0?slope:initial_period;
-    }
-}
 
-static double estimate_bpm(const double *env, size_t n, double *fit_residual, double *relative_error) {
-    size_t fft_n = 1, i, lag, best = 0;
-    Complex *a; double best_score = -1e300;
-    while (fft_n < n * 2) { if (fft_n > ((size_t)-1) / 2) return 0; fft_n <<= 1; }
-    a = (Complex *)calloc(fft_n, sizeof(Complex)); if (!a) return 0;
-    for (i = 0; i < n; ++i) a[i].re = env[i];
-    fft(a, fft_n, 0);
-    for (i = 0; i < fft_n; ++i) { a[i].re = a[i].re * a[i].re + a[i].im * a[i].im; a[i].im = 0.0; }
-    fft(a, fft_n, 1);
-    /* Find repeated autocorrelation peaks and prefer a period supported by at
-       least four harmonics, as Auto_Timing_Analyze does. */
-    for (lag = 200; lag <= 2000 && lag < n / 2; ++lag) {
-        double peak=a[lag].re, sum=0.0, average;
-        size_t j, harmonic, hits=0;
-        int local=1;
-        for(j=lag>16?lag-16:1;j<=lag+16 && j<fft_n/2;++j)
-            if(j!=lag && a[j].re>peak){local=0;break;}
-        if(!local)continue;
-        for(harmonic=1;harmonic*lag<=2000 && harmonic*lag<n/2;++harmonic){
-            size_t center=harmonic*lag, lo=center>10?center-10:1, hi=center+10;
-            size_t q, found=center; double value=-1e300;
-            if(hi>=n/2)hi=n/2-1;
-            for(q=lo;q<=hi;++q)if(a[q].re>=a[q-1].re && a[q].re>=a[q+1].re && a[q].re>value){value=a[q].re;found=q;}
-            if(value>-1e299 && (harmonic==1 || (found>harmonic*lag-11 && found<harmonic*lag+11))){sum+=value;++hits;}
-        }
-        if(hits<4)continue;
-        average=sum/(double)hits;
-        if(peak*.7>=average)continue;
-        if(average>best_score){best_score=average;best=lag;}
-    }
-    /* Fall back to the strongest single peak for short or sparse material. */
-    if(!best)for(lag=200;lag<=2000 && lag<n/2;++lag)if(a[lag].re>best_score){best_score=a[lag].re;best=lag;}
-    if (!best) { free(a); return 0; }
-    /* Parabolic sub-millisecond peak interpolation. */
-    { double l = a[best - 1].re, c = a[best].re, r = a[best + 1].re;
-      double den = l - 2.0 * c + r, shift = fabs(den) > 1e-20 ? 0.5 * (l - r) / den : 0.0;
-      double period = best + fmax(-0.5, fmin(0.5, shift)); free(a);
-      period = fit_peak_period(env, n, period, fit_residual, relative_error);
-      return 60000.0 / period; }
-}
-
-static int fluctuates(const double *env, size_t n, double whole) {
-    size_t win = 16000, step = 8000, start; double lo = 1e9, hi = 0.0; int count = 0;
-    if (n < win * 2) return 0;
-    for (start = 0; start + win <= n; start += step) {
-        double bpm = estimate_bpm(env + start, win, NULL, NULL);
-        if (bpm > 0) {
-            double aligned=bpm, distance=fabs(bpm-whole);
-            const double factors[4]={.5,1.0,2.0,3.0};
-            size_t f;
-            for(f=0;f<4;++f){double candidate=bpm*factors[f],d=fabs(candidate-whole);if(d<distance){distance=d;aligned=candidate;}}
-            if (aligned < lo) lo = aligned;
-            if (aligned > hi) hi = aligned;
+    for (beat = 0; (double)best_phase + beat * period < n; ++beat) {
+        size_t center = best_phase + beat * period;
+        size_t peak = local_envelope_peak(envelope, n, center);
+        if (envelope[peak] > 0.0) {
+            double x = (double)beat, y = (double)peak;
+            sx += x;
+            sy += y;
+            sxx += x * x;
+            sxy += x * y;
+            syy += y * y;
             ++count;
         }
     }
-    (void)whole;
-    return count >= 2 && hi - lo > fmax(3.0, whole * 0.03);
+    if (count < 4 || count * sxx <= sx * sx) {
+        if (residual_ms) *residual_ms = 1e9;
+        if (relative_period_error) *relative_period_error = 1.0;
+        return initial_period;
+    }
+
+    centered_xx = sxx - sx * sx / count;
+    centered_xy = sxy - sx * sy / count;
+    centered_yy = syy - sy * sy / count;
+    slope = centered_xy / centered_xx;
+    sse = centered_yy - centered_xy * centered_xy / centered_xx;
+    sigma = sqrt(fmax(0.0, sse) / (count - 2));
+    slope_error = sigma / sqrt(centered_xx);
+    if (residual_ms) *residual_ms = sqrt(fmax(0.0, sse) / (count - 1));
+    if (relative_period_error)
+        *relative_period_error = slope > 0.0 ? slope_error / slope : 1.0;
+    return slope > 0.0 ? slope : initial_period;
+}
+
+static size_t best_autocorrelation_lag(const Complex *correlation, size_t n, size_t fft_n) {
+    size_t lag, best = 0;
+    double best_score = -1e300;
+    /* Prefer a local peak supported by at least four harmonic peaks. */
+    for (lag = 200; lag <= 2000 && lag < n / 2; ++lag) {
+        const double peak = correlation[lag].re;
+        size_t neighbor, harmonic, hits = 0;
+        double sum = 0.0, average;
+        int is_local_peak = 1;
+
+        for (neighbor = lag > 16 ? lag - 16 : 1;
+             neighbor <= lag + 16 && neighbor < fft_n / 2; ++neighbor) {
+            if (neighbor != lag && correlation[neighbor].re > peak) {
+                is_local_peak = 0;
+                break;
+            }
+        }
+        if (!is_local_peak) continue;
+        for (harmonic = 1; harmonic * lag <= 2000 && harmonic * lag < n / 2; ++harmonic) {
+            size_t center = harmonic * lag;
+            size_t first = center > 10 ? center - 10 : 1;
+            size_t last = center + 10, index, found = center;
+            double value = -1e300;
+            if (last >= n / 2) last = n / 2 - 1;
+            for (index = first; index <= last; ++index) {
+                double candidate = correlation[index].re;
+                if (candidate >= correlation[index - 1].re &&
+                    candidate >= correlation[index + 1].re && candidate > value) {
+                    value = candidate;
+                    found = index;
+                }
+            }
+            if (value > -1e299 &&
+                (harmonic == 1 || (found > harmonic * lag - 11 && found < harmonic * lag + 11))) {
+                sum += value;
+                ++hits;
+            }
+        }
+        if (hits < 4) continue;
+        average = sum / hits;
+        if (peak * 0.7 >= average) continue;
+        if (average > best_score) { best_score = average; best = lag; }
+    }
+    /* Sparse or short material falls back to the largest single peak. */
+    if (!best) {
+        for (lag = 200; lag <= 2000 && lag < n / 2; ++lag) {
+            if (correlation[lag].re > best_score) {
+                best_score = correlation[lag].re;
+                best = lag;
+            }
+        }
+    }
+    return best;
+}
+
+static double estimate_bpm(const double *envelope, size_t n,
+                           double *fit_residual, double *relative_error) {
+    size_t fft_n = 1, index, lag;
+    Complex *correlation;
+    double left, center, right, denominator, shift, period;
+    while (fft_n < n * 2) {
+        if (fft_n > ((size_t)-1) / 2) return 0.0;
+        fft_n <<= 1;
+    }
+    correlation = (Complex *)calloc(fft_n, sizeof(Complex));
+    if (!correlation) return 0.0;
+    for (index = 0; index < n; ++index) correlation[index].re = envelope[index];
+    fft(correlation, fft_n, 0);
+    for (index = 0; index < fft_n; ++index) {
+        correlation[index].re = correlation[index].re * correlation[index].re +
+                                correlation[index].im * correlation[index].im;
+        correlation[index].im = 0.0;
+    }
+    fft(correlation, fft_n, 1);
+    lag = best_autocorrelation_lag(correlation, n, fft_n);
+    if (!lag) { free(correlation); return 0.0; }
+
+    /* Parabolic interpolation gives a sub-millisecond starting period. */
+    left = correlation[lag - 1].re;
+    center = correlation[lag].re;
+    right = correlation[lag + 1].re;
+    denominator = left - 2.0 * center + right;
+    shift = fabs(denominator) > 1e-20 ? 0.5 * (left - right) / denominator : 0.0;
+    period = lag + fmax(-0.5, fmin(0.5, shift));
+    free(correlation);
+    period = fit_peak_period(envelope, n, period, fit_residual, relative_error);
+    return 60000.0 / period;
+}
+
+static int fluctuates(const double *env, size_t n, double whole) {
+    static const double beat_factors[] = {0.5, 2.0 / 3.0, 0.75, 1.0,
+                                          4.0 / 3.0, 1.5, 2.0, 3.0};
+    const size_t window = 16000, step = 8000;
+    const double tolerance = fmax(3.0, whole * 0.03);
+    size_t start, factor;
+    int windows = 0, outliers = 0, streak = 0, longest_streak = 0;
+
+    if (n < window * 2) return 0;
+    for (start = 0; start + window <= n; start += step) {
+        double local = estimate_bpm(env + start, window, NULL, NULL);
+        double distance;
+        if (local <= 0.0) {
+            streak = 0;
+            continue;
+        }
+
+        distance = fabs(local - whole);
+        for (factor = 0; factor < sizeof(beat_factors) / sizeof(beat_factors[0]); ++factor) {
+            double candidate = local * beat_factors[factor];
+            double difference = fabs(candidate - whole);
+            if (difference < distance) distance = difference;
+        }
+
+        ++windows;
+        if (distance > tolerance) {
+            ++outliers;
+            ++streak;
+            if (streak > longest_streak) longest_streak = streak;
+        } else {
+            streak = 0;
+        }
+    }
+
+    /* A single mistaken beat subdivision does not establish a tempo change. */
+    return windows >= 3 && outliers >= 3 && outliers * 5 >= windows && longest_streak >= 3;
 }
 
 static double native_grid_quantize(double bpm, double bpm_error) {
@@ -470,8 +614,286 @@ static double native_grid_quantize(double bpm, double bpm_error) {
     return bpm;
 }
 
-#ifdef _WIN32
 #define MAX_RANGES 128
+#define TUI_MAX_WIDTH 2000
+
+typedef struct {
+    const Wave *wave;
+    const char *name, *status, *command;
+    const MeasureRange *ranges;
+    size_t frames;
+    int range_count, pending, mouse_x;
+    double pending_time, current_time, span, duration;
+} TuiView;
+
+typedef struct {
+    int width, height, graph_height, visible_ranges, visible_complete;
+} TuiLayout;
+
+typedef struct {
+    int top, bottom, glyph, filled;
+} TuiColumn;
+
+typedef void (*TuiWriteLine)(void *context, int row, const char *line);
+
+static TuiLayout tui_layout(int width, int height, int range_count, int pending) {
+    TuiLayout layout;
+    int max_range_rows;
+    if (width < 20) width = 20;
+    if (width > TUI_MAX_WIDTH) width = TUI_MAX_WIDTH;
+    if (width > 20) --width; /* Leave the last column empty to avoid wrapping. */
+    if (height < 8) height = 8;
+
+    layout.width = width;
+    layout.height = height;
+    max_range_rows = height - 11;
+    if (max_range_rows < 0) max_range_rows = 0;
+    layout.visible_ranges = range_count + (pending ? 1 : 0);
+    if (layout.visible_ranges > max_range_rows) layout.visible_ranges = max_range_rows;
+    layout.visible_complete = range_count < layout.visible_ranges ? range_count : layout.visible_ranges;
+    layout.graph_height = (height - 5 - layout.visible_ranges) / 2;
+    if (layout.graph_height < 3) layout.graph_height = 3;
+    return layout;
+}
+
+static const char *tui_basename(const char *path) {
+    const char *slash, *backslash;
+    if (!path) return "audio";
+    slash = strrchr(path, '/');
+    backslash = strrchr(path, '\\');
+    if (backslash && (!slash || backslash > slash)) return backslash + 1;
+    return slash ? slash + 1 : path;
+}
+
+static int tui_time_x(const TuiView *view, TuiLayout layout, double time) {
+    return layout.width / 2 + (int)((time - view->current_time) *
+                                    (layout.width - 3) / view->span);
+}
+
+static TuiColumn tui_column(const TuiView *view, TuiLayout layout, int x) {
+    const Wave *wave = view->wave;
+    const double bin_seconds = view->span / (layout.width - 3);
+    const double center = view->current_time + (x - layout.width / 2) * bin_seconds;
+    const double left = (center - bin_seconds * 0.5) * wave->rate;
+    const double right = (center + bin_seconds * 0.5) * wave->rate;
+    long long low = (long long)floor(left), high = (long long)ceil(right);
+    double sum_squares = 0.0, peak[3] = {0.0, 0.0, 0.0};
+    size_t first, last, frame;
+    int amplitude, glyph = 0;
+    TuiColumn column;
+
+    if (low < 0) low = 0;
+    if (high < 0) high = 0;
+    if (low > (long long)view->frames) low = (long long)view->frames;
+    if (high > (long long)view->frames) high = (long long)view->frames;
+    first = (size_t)low;
+    last = (size_t)high;
+    for (frame = first; frame < last; ++frame) {
+        double sample = 0.0;
+        unsigned channel;
+        size_t segment = ((frame - first) * 3) / (last - first);
+        if (segment > 2) segment = 2;
+        for (channel = 0; channel < wave->channels; ++channel) {
+            const size_t index = (frame * wave->channels + channel) * (wave->bits / 8);
+            sample += sample_at(wave->data + index, wave->format, wave->bits);
+        }
+        sample /= wave->channels;
+        sum_squares += sample * sample;
+        if (fabs(sample) > peak[segment]) peak[segment] = fabs(sample);
+    }
+    if (peak[1] > peak[glyph]) glyph = 1;
+    if (peak[2] > peak[glyph]) glyph = 2;
+    amplitude = last > first ? (int)(sqrt(sum_squares / (last - first)) *
+                                     (layout.graph_height - 2) * 4.0) : 0;
+    column.top = layout.graph_height / 2 - amplitude / 2;
+    column.bottom = layout.graph_height / 2 + amplitude / 2;
+    if (column.top < 0) column.top = 0;
+    if (column.bottom >= layout.graph_height) column.bottom = layout.graph_height - 1;
+    column.glyph = glyph;
+    column.filled = amplitude > 0;
+    return column;
+}
+
+static void tui_draw_range(const TuiView *view, TuiLayout layout, int range_index,
+                           TuiWriteLine write, void *context) {
+    char row[TUI_MAX_WIDTH + 1], label[24];
+    int x, start = tui_time_x(view, layout, view->ranges[range_index].start);
+    int end = tui_time_x(view, layout, view->ranges[range_index].end);
+    memset(row, ' ', (size_t)layout.width);
+    if (end >= 1 && start < layout.width - 1) {
+        int label_start, label_length;
+        if (start < 1) start = 1;
+        if (end >= layout.width - 1) end = layout.width - 2;
+        if (start <= end) {
+            row[start] = '[';
+            row[end] = ']';
+            for (x = start + 1; x < end; ++x) row[x] = '-';
+            snprintf(label, sizeof(label), "<%d>", range_index + 1);
+            label_length = (int)strlen(label);
+            label_start = start + 1 + (end - start - 1 - label_length) / 2;
+            if (label_start > start && label_start + label_length < end)
+                memcpy(row + label_start, label, (size_t)label_length);
+        }
+    }
+    row[layout.width] = 0;
+    write(context, layout.graph_height + 4 + range_index, row);
+}
+
+static void tui_draw_pending(const TuiView *view, TuiLayout layout,
+                             TuiWriteLine write, void *context) {
+    char row[TUI_MAX_WIDTH + 1];
+    int x, start = tui_time_x(view, layout, view->pending_time), end = view->mouse_x;
+    memset(row, ' ', (size_t)layout.width);
+    if (start < 1) start = 1;
+    if (start > layout.width - 2) start = layout.width - 2;
+    if (end < 1) end = 1;
+    if (end > layout.width - 2) end = layout.width - 2;
+    row[start] = '[';
+    if (start < end) for (x = start + 1; x <= end; ++x) row[x] = '-';
+    else for (x = end; x < start; ++x) row[x] = '-';
+    row[layout.width] = 0;
+    write(context, layout.graph_height + 4 + layout.visible_complete, row);
+}
+
+static void tui_render(const TuiView *view, TuiLayout layout, TuiLayout *previous,
+                       TuiWriteLine write, void *context) {
+    static const char *glyphs[3] = {"\xE2\x96\x8F", "\xE2\x94\x82", "\xE2\x96\x95"};
+    TuiColumn columns[TUI_MAX_WIDTH];
+    char row[TUI_MAX_WIDTH * 3 + 4], message[512];
+    int x, y;
+
+    if (previous->width != layout.width || previous->height != layout.height ||
+        previous->graph_height != layout.graph_height ||
+        previous->visible_ranges != layout.visible_ranges) {
+        for (y = 2; y <= layout.height - 3; ++y) write(context, y, "");
+    }
+    *previous = layout;
+
+    snprintf(message, sizeof(message), "%s  Time: %.2f / %.2f sec   ranges:%d",
+             tui_basename(view->name), view->current_time, view->duration, view->range_count);
+    message[layout.width < (int)sizeof(message) ? layout.width : (int)sizeof(message) - 1] = 0;
+    write(context, 1, message);
+
+    memset(row, '-', (size_t)layout.width);
+    row[0] = '+';
+    row[layout.width - 1] = '+';
+    row[layout.width] = 0;
+    write(context, 2, row);
+    for (x = 1; x < layout.width - 1; ++x) columns[x] = tui_column(view, layout, x);
+    for (y = 0; y < layout.graph_height; ++y) {
+        size_t used = 0;
+        row[used++] = '|';
+        for (x = 1; x < layout.width - 1; ++x) {
+            if (x == layout.width / 2) row[used++] = '#';
+            else if (columns[x].filled && y >= columns[x].top && y <= columns[x].bottom) {
+                const char *glyph = glyphs[columns[x].glyph];
+                while (*glyph) row[used++] = *glyph++;
+            } else row[used++] = ' ';
+        }
+        row[used++] = '|';
+        row[used] = 0;
+        write(context, y + 3, row);
+    }
+    memset(row, '-', (size_t)layout.width);
+    row[0] = '+';
+    row[layout.width - 1] = '+';
+    row[layout.width] = 0;
+    write(context, layout.graph_height + 3, row);
+
+    for (y = 0; y < layout.visible_complete; ++y)
+        tui_draw_range(view, layout, y, write, context);
+    if (view->pending && layout.visible_ranges > layout.visible_complete)
+        tui_draw_pending(view, layout, write, context);
+
+    if (layout.height >= 9)
+        write(context, layout.height - 2, "Ctrl+C exit | Space play/pause | Wheel seek (stops playback)");
+    snprintf(message, sizeof(message),
+             "Left click x2 range | Right click delete | get+Enter results | %s", view->status);
+    message[layout.width < (int)sizeof(message) ? layout.width : (int)sizeof(message) - 1] = 0;
+    write(context, layout.height - 1, message);
+    snprintf(message, sizeof(message), "Command: %s", view->command);
+    message[layout.width < (int)sizeof(message) ? layout.width : (int)sizeof(message) - 1] = 0;
+    write(context, layout.height, message);
+}
+
+static void tui_print_results(const Wave *wave, const MeasureRange *ranges, int count) {
+    int index;
+    for (index = 0; index < count; ++index) {
+        const size_t bytes_per_frame = (wave->bits / 8) * wave->channels;
+        const size_t first = (size_t)(ranges[index].start * wave->rate);
+        const size_t last = (size_t)(ranges[index].end * wave->rate);
+        Wave part = *wave;
+        double *envelope, bpm = 0.0, offset = 0.0, residual = 0.0, error = 1.0;
+        size_t envelope_length;
+        part.data = wave->data + first * bytes_per_frame;
+        part.size = (last - first) * bytes_per_frame;
+        if (last > first && (envelope = make_envelope(&part, &envelope_length, &offset)) != NULL) {
+            bpm = estimate_bpm(envelope, envelope_length, &residual, &error);
+            if (bpm > 0.0 && error <= 0.00005)
+                bpm = native_grid_quantize(bpm, bpm * error);
+            free(envelope);
+        }
+        printf("%d.BPM:%.1f,offset:%.1f ms;\n", index + 1, bpm, offset);
+    }
+}
+
+static double tui_time_at_x(int x, int width, double current_time,
+                            double span, double duration) {
+    double time = current_time + (x - width / 2) * span / (width - 3);
+    if (time < 0.0) time = 0.0;
+    if (time > duration) time = duration;
+    return time;
+}
+
+static void tui_select_range(MeasureRange *ranges, int *count, int *pending,
+                             double *pending_time, double time, char *status) {
+    if (!*pending) {
+        *pending_time = time;
+        *pending = 1;
+        strcpy(status, "Start selected; click end");
+    } else if (*count < MAX_RANGES) {
+        ranges[*count].start = fmin(*pending_time, time);
+        ranges[*count].end = fmax(*pending_time, time);
+        ++*count;
+        *pending = 0;
+        strcpy(status, "Range added");
+    }
+}
+
+static void tui_delete_range(MeasureRange *ranges, int *count, double time,
+                             int mouse_y, int graph_height, char *status) {
+    int index;
+    for (index = 0; index < *count; ++index) {
+        int on_wave = mouse_y >= 2 && mouse_y <= graph_height + 1;
+        int on_range_row = mouse_y == graph_height + 3 + index;
+        if (time >= ranges[index].start && time <= ranges[index].end &&
+            (on_wave || on_range_row)) {
+            memmove(&ranges[index], &ranges[index + 1],
+                    (size_t)(*count - index - 1) * sizeof(ranges[0]));
+            --*count;
+            strcpy(status, "Range deleted");
+            return;
+        }
+    }
+}
+
+static int tui_submit_command(const Wave *wave, char *command,
+                              char *status, size_t status_cap) {
+    if (!strcmp(command, "get")) return 1;
+    if (!strcmp(command, "offset")) {
+        size_t envelope_length;
+        double offset;
+        double *envelope = make_envelope(wave, &envelope_length, &offset);
+        if (envelope) {
+            snprintf(status, status_cap, "Offset: %.1f ms", offset);
+            free(envelope);
+        }
+    }
+    command[0] = 0;
+    return 0;
+}
+
+#ifdef _WIN32
 static volatile LONG tui_quit_requested=0;
 
 static BOOL WINAPI tui_ctrl_handler(DWORD event) {
@@ -538,10 +960,15 @@ static void tui_write_at(HANDLE hout, int row, const char *text) {
     tui_write(hout,seq); tui_write(hout,text);
 }
 
+static void tui_write_line(void *context, int row, const char *text) {
+    tui_write_at((HANDLE)context, row, text);
+}
+
 static int run_tui(Wave *w, const char *name) {
     HANDLE hin=GetStdHandle(STD_INPUT_HANDLE), hout=GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD oldmode=0, mode, oldout=0, last_buttons=0; UINT oldcp; CONSOLE_SCREEN_BUFFER_INFO cs; INPUT_RECORD ev; DWORD got;
-    MeasureRange ranges[MAX_RANGES]; int nr=0,pending=0,play=0,mouse_x=40,redraw=1,last_range_count=-1,last_graph_h=-1,last_height=-1; double pending_t=0,span,current_time=0;
+    MeasureRange ranges[MAX_RANGES]; int nr=0,pending=0,play=0,mouse_x=40,redraw=1; double pending_t=0,span,current_time=0;
+    TuiLayout previous={.width=-1};
     char cmd[128]="", status[256]=""; size_t framebytes=(w->bits/8)*w->channels, frames=w->size/framebytes;
     HWAVEOUT out=NULL; WAVEHDR hdr; short *pcm=NULL; size_t pcm_count=0; double playback_base=0,duration=(double)frames/w->rate;
     if(!GetConsoleMode(hin,&oldmode)||!GetConsoleMode(hout,&oldout)){fprintf(stderr,"TUI requires a Windows console.\n");return -1;}
@@ -559,69 +986,24 @@ static int run_tui(Wave *w, const char *name) {
         if(InterlockedCompareExchange(&tui_quit_requested,0,0))break;
         if(play&&out){current_time=tui_audio_position(out,playback_base,w->rate,w->channels,current_time);if(current_time>duration)current_time=duration;
             if(hdr.dwFlags&WHDR_DONE){current_time=duration;stop_tui_audio(&out,&hdr,&pcm,&play);strcpy(status,"Playback finished");redraw=1;}}
-        int width=80,height=25,x,y,graph_h,shown_ranges,range_count,max_range_rows; double cursor=current_time;
-        GetConsoleScreenBufferInfo(hout,&cs); width=cs.srWindow.Right-cs.srWindow.Left+1;height=cs.srWindow.Bottom-cs.srWindow.Top+1;
-        if(width<20)width=20;
-        if(width>2000)width=2000;
-        if(width>20)width--;
-        if(height<8)height=8;
-        if(current_time<0)current_time=0;
-        if(current_time>duration)current_time=duration;
-        cursor=current_time;
-        range_count=nr+(pending?1:0);
-        max_range_rows=height-11;if(max_range_rows<0)max_range_rows=0;
-        if(range_count>max_range_rows)range_count=max_range_rows;
-        shown_ranges=nr<range_count?nr:range_count;
-        graph_h=(height-5-range_count)/2;
-        if(graph_h<3)graph_h=3;
-        if(redraw||play){
-        if(range_count!=last_range_count||graph_h!=last_graph_h||height!=last_height){
-            for(y=2;y<=height-3;++y)tui_write_at(hout,y,"");
-            last_range_count=range_count;last_graph_h=graph_h;last_height=height;
-        }
-        {char line[512];const char *shown=name?name:"audio",*base1=strrchr(shown,'\\'),*base2=strrchr(shown,'/');if(base1&&(!base2||base1>base2))shown=base1+1;else if(base2)shown=base2+1;snprintf(line,sizeof(line),"%s  Time: %.2f / %.2f sec   ranges:%d",shown,current_time,duration,nr);line[width<511?width:511]=0;tui_write_at(hout,1,line);}
-        {char row[2048];memset(row,'-',(size_t)width);row[0]='+';row[width-1]='+';row[width]=0;tui_write_at(hout,2,row);}
-        {int amps[2048],tops[2048],bots[2048],best_bins[2048];
-            for(x=1;x<width-1;++x){double t=current_time+((double)x-(double)(width/2))*span/(width-3),bin_seconds=span/(width-3),sum_sq=0.0,sub_peak[3]={0,0,0};size_t f0,f1,j,count=0;int amp,top,bot,best=0;
-                {double left=(t-bin_seconds*.5)*w->rate,right=(t+bin_seconds*.5)*w->rate;long long lo=(long long)floor(left),hi=(long long)ceil(right);if(lo<0)lo=0;if(lo>(long long)frames)lo=(long long)frames;if(hi<0)hi=0;if(hi>(long long)frames)hi=(long long)frames;f0=(size_t)lo;f1=(size_t)hi;}
-                for(j=f0;j<f1;++j){double v=0.0;unsigned c;size_t seg=((j-f0)*3)/(f1-f0);if(seg>2)seg=2;for(c=0;c<w->channels;++c)v+=sample_at(w->data+(j*w->channels+c)*(w->bits/8),w->format,w->bits);v/=w->channels;sum_sq+=v*v;if(fabs(v)>sub_peak[seg])sub_peak[seg]=fabs(v);++count;}
-                if(sub_peak[1]>sub_peak[best])best=1;
-                if(sub_peak[2]>sub_peak[best])best=2;
-                {double rms=count?sqrt(sum_sq/count):0.0;amp=(int)(rms*(graph_h-2)*4.0);}
-                top=graph_h/2-amp/2;bot=graph_h/2+amp/2;if(top<0)top=0;if(bot>=graph_h)bot=graph_h-1;amps[x]=amp;tops[x]=top;bots[x]=bot;best_bins[x]=best;
-            }
-            for(y=0;y<graph_h;++y){char row[8192];size_t used=0;row[used++]='|';
-                for(x=1;x<width-1;++x){if(x==width/2)row[used++]='#';else if(y>=tops[x]&&y<=bots[x]&&amps[x]>0){static const char *glyphs[3]={"\xE2\x96\x8F","\xE2\x94\x82","\xE2\x96\x95"};const char *g=glyphs[best_bins[x]];while(*g)row[used++]=*g++;}else row[used++]=' ';}
-                row[used++]='|';row[used]=0;tui_write_at(hout,y+3,row);
-            }
-        }
-        {char row[2048];memset(row,'-',(size_t)width);row[0]='+';row[width-1]='+';row[width]=0;tui_write_at(hout,graph_h+3,row);}
-        for(y=0;y<shown_ranges;y++){
-            char row[2048],label[24];
-            int a=width/2+(int)((ranges[y].start-cursor)*(width-3)/span);
-            int b=width/2+(int)((ranges[y].end-cursor)*(width-3)/span);
-            memset(row,' ',(size_t)width);
-            if(b>=1&&a<width-1){
-                if(a<1)a=1;
-                if(b>=width-1)b=width-2;
-                if(a<=b){
-                    int label_start,label_len;
-                    row[a]='[';row[b]=']';
-                    for(x=a+1;x<b;x++)row[x]='-';
-                    snprintf(label,sizeof(label),"<%d>",y+1);
-                    label_len=(int)strlen(label);
-                    label_start=a+1+(b-a-1-label_len)/2;
-                    if(label_start>a&&label_start+label_len<b)
-                        memcpy(row+label_start,label,(size_t)label_len);
-                }
-            }
-            row[width]=0;
-            tui_write_at(hout,graph_h+4+y,row);
-        }
-        if(pending&&range_count>shown_ranges){char row[2048];int a=width/2+(int)((pending_t-cursor)*(width-3)/span),b=mouse_x;memset(row,' ',(size_t)width);if(a<1)a=1;if(a>width-2)a=width-2;if(b<1)b=1;if(b>width-2)b=width-2;row[a]='[';if(a<b)for(x=a+1;x<=b;x++)row[x]='-';else for(x=b;x<a;x++)row[x]='-';row[width]=0;tui_write_at(hout,graph_h+4+shown_ranges,row);}
-        if(height>=9)tui_write_at(hout,height-2,"Ctrl+C exit | Space play/pause | Wheel seek (stops playback)");
-        {char msg[512];snprintf(msg,sizeof(msg),"Left click x2 range | Right click delete | get+Enter results | %s",status);msg[width<511?width:511]=0;tui_write_at(hout,height-1,msg);}
-        {char msg[160];snprintf(msg,sizeof(msg),"Command: %s",cmd);msg[width<159?width:159]=0;tui_write_at(hout,height,msg);}
+        int width = 80, height = 25, graph_h;
+        TuiLayout layout;
+        GetConsoleScreenBufferInfo(hout, &cs);
+        width = cs.srWindow.Right - cs.srWindow.Left + 1;
+        height = cs.srWindow.Bottom - cs.srWindow.Top + 1;
+        if (current_time < 0.0) current_time = 0.0;
+        if (current_time > duration) current_time = duration;
+        layout = tui_layout(width, height, nr, pending);
+        width = layout.width;
+        graph_h = layout.graph_height;
+        if (redraw || play) {
+            TuiView view = {
+                .wave=w, .name=name, .status=status, .command=cmd, .ranges=ranges,
+                .frames=frames, .range_count=nr, .pending=pending, .mouse_x=mouse_x,
+                .pending_time=pending_t, .current_time=current_time,
+                .span=span, .duration=duration
+            };
+            tui_render(&view, layout, &previous, tui_write_line, hout);
         }
         if(WaitForSingleObject(hin,50)!=WAIT_OBJECT_0){redraw=0;continue;}
         if(!ReadConsoleInputA(hin,&ev,1,&got)||!got){redraw=0;continue;}
@@ -637,7 +1019,9 @@ static int run_tui(Wave *w, const char *name) {
                 if(!play){if(start_tui_audio(w,frames,&current_time,&out,&hdr,&pcm,&pcm_count,&playback_base)){play=1;strcpy(status,"Playing");}else strcpy(status,"Playback could not start");}
                 else{current_time=tui_audio_position(out,playback_base,w->rate,w->channels,current_time);if(current_time>duration)current_time=duration;stop_tui_audio(&out,&hdr,&pcm,&play);strcpy(status,"Paused");}
             }
-            else if(c=='\r'){if(!strcmp(cmd,"get")){break;}else if(!strcmp(cmd,"offset")){double *e;size_t en;double off;if((e=make_envelope(w,&en,&off))!=NULL){snprintf(status,sizeof(status),"Offset: %.1f ms",off);free(e);}}cmd[0]=0;}
+            else if(c=='\r'){
+                if(tui_submit_command(w,cmd,status,sizeof(status)))break;
+            }
             else if(c==8){size_t n=strlen(cmd);if(n)cmd[n-1]=0;}
             else if(c>=32&&strlen(cmd)<sizeof(cmd)-2){size_t n=strlen(cmd);cmd[n]=c;cmd[n+1]=0;}
         } else if(ev.EventType==MOUSE_EVENT){MOUSE_EVENT_RECORD m=ev.Event.MouseEvent;
@@ -647,18 +1031,13 @@ static int run_tui(Wave *w, const char *name) {
             mouse_x=mx;
             if(m.dwEventFlags==MOUSE_WHEELED){short d=(short)HIWORD(m.dwButtonState);if(play&&out){current_time=tui_audio_position(out,playback_base,w->rate,w->channels,current_time);stop_tui_audio(&out,&hdr,&pcm,&play);strcpy(status,"Playback stopped");}current_time+=(double)d/120.0*span*.12;if(current_time<0)current_time=0;if(current_time>duration)current_time=duration;}
             else {
-                double t=current_time+((double)mx-(double)(width/2))*span/(width-3);
+                double t=tui_time_at_x(mx,width,current_time,span,duration);
                 DWORD buttons=m.dwButtonState;
-                if(t<0)t=0;
-                if(t>duration)t=duration;
                 if((buttons&FROM_LEFT_1ST_BUTTON_PRESSED)&&!(last_buttons&FROM_LEFT_1ST_BUTTON_PRESSED)&&my>=2&&my<=graph_h+1){
-                    if(!pending){pending_t=t;pending=1;strcpy(status,"Start selected; click end");}
-                    else if(nr<MAX_RANGES){ranges[nr].start=fmin(pending_t,t);ranges[nr].end=fmax(pending_t,t);ranges[nr].complete=1;nr++;pending=0;strcpy(status,"Range added");}
+                    tui_select_range(ranges,&nr,&pending,&pending_t,t,status);
                 }
                 if((buttons&RIGHTMOST_BUTTON_PRESSED)&&!(last_buttons&RIGHTMOST_BUTTON_PRESSED)){
-                    int r;for(r=0;r<nr;r++)if(t>=ranges[r].start&&t<=ranges[r].end&&((my>=2&&my<=graph_h+1)||my==graph_h+3+r)){
-                        memmove(&ranges[r],&ranges[r+1],(size_t)(nr-r-1)*sizeof(ranges[0]));nr--;strcpy(status,"Range deleted");break;
-                    }
+                    tui_delete_range(ranges,&nr,t,my,graph_h,status);
                 }
                 last_buttons=buttons;
             }
@@ -668,12 +1047,10 @@ static int run_tui(Wave *w, const char *name) {
     tui_write(hout,"\x1b[0m\x1b[?25h\x1b[2J\x1b[H");
     SetConsoleMode(hin,oldmode);SetConsoleMode(hout,oldout);SetConsoleOutputCP(oldcp);
     SetConsoleCtrlHandler(tui_ctrl_handler,FALSE);
-    if(!strcmp(cmd,"get")){int r;for(r=0;r<nr;r++){size_t b=(size_t)(ranges[r].start*w->rate),e=(size_t)(ranges[r].end*w->rate),bytes=(w->bits/8)*w->channels,n;Wave part=*w;double *env,bpm=0,off=0,err=1,res=0;part.data=w->data+b*bytes;part.size=(e-b)*bytes;if(e>b&&(env=make_envelope(&part,&n,&off))!=NULL){bpm=estimate_bpm(env,n,&res,&err);if(bpm>0&&err<=.00005)bpm=native_grid_quantize(bpm,bpm*err);free(env);}printf("%d.BPM:%.1f,offset:%.1f ms;\n",r+1,bpm,off);}}
+    if(!strcmp(cmd,"get")) tui_print_results(w, ranges, nr);
     return 0;
 }
 #else
-#define MAX_RANGES 128
-
 typedef struct {
     pid_t pid;
     char path[4096];
@@ -819,12 +1196,18 @@ static void tui_write_at(int row, const char *line) {
     printf("\x1b[%d;1H\x1b[2K%s", row, line);
 }
 
+static void tui_write_line(void *context, int row, const char *line) {
+    (void)context;
+    tui_write_at(row, line);
+}
+
 static int run_tui(Wave *w, const char *name) {
     struct termios old_term, raw_term;
     MeasureRange ranges[MAX_RANGES];
     PosixPlayback audio = {0};
     int nr=0, pending=0, play=0, mouse_x=40, redraw=1;
-    int last_range_count=-1, last_graph_h=-1, last_height=-1, done=0;
+    int done=0;
+    TuiLayout previous={.width=-1};
     double pending_t=0, current_time=0;
     char cmd[128]="", status[256]="";
     size_t framebytes=(w->bits/8)*w->channels, frames=w->size/framebytes;
@@ -846,8 +1229,8 @@ static int run_tui(Wave *w, const char *name) {
     if(span<1) span=duration;
     while(!done) {
         struct winsize ws;
-        int width=80,height=25,x,y,graph_h,shown_ranges,range_count,max_range_rows;
-        double cursor;
+        int width=80,height=25,graph_h;
+        TuiLayout layout;
         if(play && audio.pid>0) {
             int child_status;
             pid_t ended=waitpid(audio.pid,&child_status,WNOHANG);
@@ -860,94 +1243,19 @@ static int run_tui(Wave *w, const char *name) {
             }
         }
         if(ioctl(STDOUT_FILENO,TIOCGWINSZ,&ws)==0) {width=ws.ws_col;height=ws.ws_row;}
-        if(width<20)width=20;
-        if(width>2000)width=2000;
-        if(width>20)width--;
-        if(height<8)height=8;
-        if(current_time<0)current_time=0;
-        if(current_time>duration)current_time=duration;
-        cursor=current_time;
-        range_count=nr+(pending?1:0);
-        max_range_rows=height-11;if(max_range_rows<0)max_range_rows=0;
-        if(range_count>max_range_rows)range_count=max_range_rows;
-        shown_ranges=nr<range_count?nr:range_count;
-        graph_h=(height-5-range_count)/2;
-        if(graph_h<3)graph_h=3;
-        if(redraw||play) {
-            if(range_count!=last_range_count||graph_h!=last_graph_h||height!=last_height) {
-                for(y=2;y<=height-3;++y)tui_write_at(y,"");
-                last_range_count=range_count;last_graph_h=graph_h;last_height=height;
-            }
-            {char line[512];const char *shown=name?name:"audio",*b1=strrchr(shown,'/'),*b2=strrchr(shown,'\\');
-                if(b1&&(!b2||b1>b2))shown=b1+1;else if(b2)shown=b2+1;
-                snprintf(line,sizeof(line),"%s  Time: %.2f / %.2f sec   ranges:%d",shown,current_time,duration,nr);
-                line[width<511?width:511]=0;tui_write_at(1,line);}
-            {char row[2048];memset(row,'-',(size_t)width);row[0]='+';row[width-1]='+';row[width]=0;tui_write_at(2,row);}
-            {int amps[2048],tops[2048],bots[2048],best_bins[2048];
-                for(x=1;x<width-1;++x) {
-                    double t=current_time+((double)x-(double)(width/2))*span/(width-3);
-                    double bin_seconds=span/(width-3),sum_sq=0,sub_peak[3]={0,0,0};
-                    size_t f0,f1,j,count=0;int amp,top,bot,best=0;
-                    {double left=(t-bin_seconds*.5)*w->rate,right=(t+bin_seconds*.5)*w->rate;
-                        long long lo=(long long)floor(left),hi=(long long)ceil(right);
-                        if(lo<0)lo=0;if(lo>(long long)frames)lo=(long long)frames;
-                        if(hi<0)hi=0;if(hi>(long long)frames)hi=(long long)frames;
-                        f0=(size_t)lo;f1=(size_t)hi;}
-                    for(j=f0;j<f1;++j) {
-                        double v=0;unsigned c;size_t seg=((j-f0)*3)/(f1-f0);
-                        if(seg>2)seg=2;
-                        for(c=0;c<w->channels;++c)v+=sample_at(w->data+(j*w->channels+c)*(w->bits/8),w->format,w->bits);
-                        v/=w->channels;sum_sq+=v*v;
-                        if(fabs(v)>sub_peak[seg])sub_peak[seg]=fabs(v);++count;
-                    }
-                    if(sub_peak[1]>sub_peak[best])best=1;
-                    if(sub_peak[2]>sub_peak[best])best=2;
-                    {double rms=count?sqrt(sum_sq/count):0;amp=(int)(rms*(graph_h-2)*4.0);}
-                    top=graph_h/2-amp/2;bot=graph_h/2+amp/2;
-                    if(top<0)top=0;if(bot>=graph_h)bot=graph_h-1;
-                    amps[x]=amp;tops[x]=top;bots[x]=bot;best_bins[x]=best;
-                }
-                for(y=0;y<graph_h;++y) {char row[8192];size_t used=0;row[used++]='|';
-                    for(x=1;x<width-1;++x) {
-                        if(x==width/2)row[used++]='#';
-                        else if(y>=tops[x]&&y<=bots[x]&&amps[x]>0) {
-                            static const char *glyphs[3]={"\xE2\x96\x8F","\xE2\x94\x82","\xE2\x96\x95"};
-                            const char *g=glyphs[best_bins[x]];while(*g)row[used++]=*g++;
-                        } else row[used++]=' ';
-                    }
-                    row[used++]='|';row[used]=0;tui_write_at(y+3,row);
-                }
-            }
-            {char row[2048];memset(row,'-',(size_t)width);row[0]='+';row[width-1]='+';row[width]=0;tui_write_at(graph_h+3,row);}
-            for(y=0;y<shown_ranges;y++) {
-                char row[2048],label[24];
-                int a=width/2+(int)((ranges[y].start-cursor)*(width-3)/span);
-                int b=width/2+(int)((ranges[y].end-cursor)*(width-3)/span);
-                memset(row,' ',(size_t)width);
-                if(b>=1&&a<width-1) {
-                    if(a<1)a=1;if(b>=width-1)b=width-2;
-                    if(a<=b) {int label_start,label_len;
-                        row[a]='[';row[b]=']';for(x=a+1;x<b;x++)row[x]='-';
-                        snprintf(label,sizeof(label),"<%d>",y+1);label_len=(int)strlen(label);
-                        label_start=a+1+(b-a-1-label_len)/2;
-                        if(label_start>a&&label_start+label_len<b)memcpy(row+label_start,label,(size_t)label_len);
-                    }
-                }
-                row[width]=0;tui_write_at(graph_h+4+y,row);
-            }
-            if(pending&&range_count>shown_ranges) {
-                char row[2048];int a=width/2+(int)((pending_t-cursor)*(width-3)/span),b=mouse_x;
-                memset(row,' ',(size_t)width);
-                if(a<1)a=1;if(a>width-2)a=width-2;if(b<1)b=1;if(b>width-2)b=width-2;
-                row[a]='[';
-                if(a<b)for(x=a+1;x<=b;x++)row[x]='-';else for(x=b;x<a;x++)row[x]='-';
-                row[width]=0;tui_write_at(graph_h+4+shown_ranges,row);
-            }
-            if(height>=9)tui_write_at(height-2,"Ctrl+C exit | Space play/pause | Wheel seek (stops playback)");
-            {char msg[512];snprintf(msg,sizeof(msg),"Left click x2 range | Right click delete | get+Enter results | %s",status);
-                msg[width<511?width:511]=0;tui_write_at(height-1,msg);}
-            {char msg[160];snprintf(msg,sizeof(msg),"Command: %s",cmd);
-                msg[width<159?width:159]=0;tui_write_at(height,msg);}
+        if (current_time < 0.0) current_time = 0.0;
+        if (current_time > duration) current_time = duration;
+        layout = tui_layout(width, height, nr, pending);
+        width = layout.width;
+        graph_h = layout.graph_height;
+        if (redraw || play) {
+            TuiView view = {
+                .wave=w, .name=name, .status=status, .command=cmd, .ranges=ranges,
+                .frames=frames, .range_count=nr, .pending=pending, .mouse_x=mouse_x,
+                .pending_time=pending_t, .current_time=current_time,
+                .span=span, .duration=duration
+            };
+            tui_render(&view, layout, &previous, tui_write_line, NULL);
             fflush(stdout);
         }
         {fd_set readfds;struct timeval timeout={0,50000};int ready;unsigned char input[128];ssize_t got,k;
@@ -971,22 +1279,16 @@ static int run_tui(Wave *w, const char *name) {
                             double t;
                             if(click_x<1)click_x=1;if(click_x>width-2)click_x=width-2;
                             mouse_x=click_x;
-                            t=current_time+((double)click_x-(double)(width/2))*span/(width-3);
-                            if(t<0)t=0;if(t>duration)t=duration;
+                            t=tui_time_at_x(click_x,width,current_time,span,duration);
                             if((button&64)&&end=='M') {
                                 if(play){current_time=tui_audio_position(&audio,duration);tui_stop_audio(&audio);play=0;strcpy(status,"Playback stopped");}
                                 current_time+=(button&1)?-span*.12:span*.12;
                                 if(current_time<0)current_time=0;if(current_time>duration)current_time=duration;
                             } else if(end=='M'&&!(button&32)) {
                                 if((button&3)==0&&click_y>=2&&click_y<=graph_h+1) {
-                                    if(!pending){pending_t=t;pending=1;strcpy(status,"Start selected; click end");}
-                                    else if(nr<MAX_RANGES){ranges[nr].start=fmin(pending_t,t);ranges[nr].end=fmax(pending_t,t);ranges[nr].complete=1;nr++;pending=0;strcpy(status,"Range added");}
+                                    tui_select_range(ranges,&nr,&pending,&pending_t,t,status);
                                 } else if((button&3)==2) {
-                                    int r;for(r=0;r<nr;r++)if(t>=ranges[r].start&&t<=ranges[r].end&&
-                                        ((click_y>=2&&click_y<=graph_h+1)||click_y==graph_h+3+r)) {
-                                        memmove(&ranges[r],&ranges[r+1],(size_t)(nr-r-1)*sizeof(ranges[0]));
-                                        nr--;strcpy(status,"Range deleted");break;
-                                    }
+                                    tui_delete_range(ranges,&nr,t,click_y,graph_h,status);
                                 }
                             }
                         } else if(!strcmp(escape,"\x1b[H")||!strcmp(escape,"\x1b[1~")||
@@ -1007,11 +1309,7 @@ static int run_tui(Wave *w, const char *name) {
                         else strcpy(status,"Playback unavailable: install ffplay (Linux) or use afplay (macOS)");
                     } else {current_time=tui_audio_position(&audio,duration);tui_stop_audio(&audio);play=0;strcpy(status,"Paused");}
                 } else if(c=='\r'||c=='\n') {
-                    if(!strcmp(cmd,"get")){done=1;break;}
-                    if(!strcmp(cmd,"offset")) {double *e;size_t en;double off;
-                        if((e=make_envelope(w,&en,&off))!=NULL){snprintf(status,sizeof(status),"Offset: %.1f ms",off);free(e);}
-                    }
-                    cmd[0]=0;
+                    if(tui_submit_command(w,cmd,status,sizeof(status))){done=1;break;}
                 } else if(c==8||c==127) {size_t n=strlen(cmd);if(n)cmd[n-1]=0;}
                 else if(c>=32&&c<127&&strlen(cmd)<sizeof(cmd)-2) {size_t n=strlen(cmd);cmd[n]=(char)c;cmd[n+1]=0;}
             }
@@ -1021,14 +1319,7 @@ static int run_tui(Wave *w, const char *name) {
     fputs("\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?25h\x1b[?1049l",stdout);
     fflush(stdout);
     tcsetattr(STDIN_FILENO,TCSANOW,&old_term);
-    if(!strcmp(cmd,"get")) {int r;for(r=0;r<nr;r++) {
-        size_t b=(size_t)(ranges[r].start*w->rate),e=(size_t)(ranges[r].end*w->rate),bytes=(w->bits/8)*w->channels,n;
-        Wave part=*w;double *env,bpm=0,off=0,err=1,res=0;
-        part.data=w->data+b*bytes;part.size=(e-b)*bytes;
-        if(e>b&&(env=make_envelope(&part,&n,&off))!=NULL){bpm=estimate_bpm(env,n,&res,&err);
-            if(bpm>0&&err<=.00005)bpm=native_grid_quantize(bpm,bpm*err);free(env);}
-        printf("%d.BPM:%.1f,offset:%.1f ms;\n",r+1,bpm,off);
-    }}
+    if(!strcmp(cmd,"get")) tui_print_results(w, ranges, nr);
     return 0;
 }
 #endif

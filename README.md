@@ -60,3 +60,7 @@ After `get`, each result is printed as:
 ```
 
 In these results, offset is measured from the start of each selected range. The command-line `--offset` value is measured from the start of the complete audio file.
+
+## Estimation limits
+
+The CLI reports one BPM for the whole audio file. Its warning checks for sustained differences across overlapping 16-second windows; very short changes may be missed. Half-time, double-time, and other beat subdivisions can sound identical to an automatic detector, so a chart may use a different but related BPM. For changing songs, select separate sections in the TUI and use `get` to measure them individually.
