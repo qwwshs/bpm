@@ -1,0 +1,9 @@
+# Local builds
+*.exe
+*.o
+*.obj
+/bpm
+
+# Local reverse-engineering workspace and downloaded tools
+/analysis/
+/tools/
