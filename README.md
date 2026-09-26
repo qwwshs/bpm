@@ -70,4 +70,4 @@ In these results, offset is measured from the start of each selected range. The 
 
 ## Estimation limits
 
-The CLI reports one BPM for the whole audio file. Its warning checks for sustained differences across overlapping 16-second windows; very short changes may be missed. Half-time, double-time, and other beat subdivisions can sound identical to an automatic detector, so a chart may use a different but related BPM. For changing songs, select separate sections in the TUI and use `get` to measure them individually.
+The CLI reports one BPM for the whole audio file. It compares strong subdivisions and combines several autocorrelation peaks to refine the beat period before fitting the audio peaks. Its warning checks for sustained differences across overlapping 16-second windows; very short changes may be missed. Half-time, double-time, and other beat subdivisions can sound identical to an automatic detector, so a chart may use a different but related BPM. For changing songs, select separate sections in the TUI and use `get` to measure them individually.

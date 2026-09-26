@@ -426,25 +426,36 @@ static size_t local_envelope_peak(const double *envelope, size_t n, size_t cente
     return best;
 }
 
-static double fit_peak_period(const double *envelope, size_t n, double initial_period,
-                              double *residual_ms, double *relative_period_error) {
+static double fit_peak_period_once(const double *envelope, size_t n, double initial_period,
+                                   double *residual_ms, double *relative_period_error) {
     size_t period = (size_t)llround(initial_period);
     size_t phase, best_phase = 0, beat, count = 0;
     double best_score = -1.0;
     double sx = 0.0, sy = 0.0, sxx = 0.0, sxy = 0.0, syy = 0.0;
     double centered_xx, centered_xy, centered_yy, slope, sse, sigma, slope_error;
 
-    if (period < 200 || period > 2000) return initial_period;
+    if (period < 180 || period > 2000) {
+        if (residual_ms) *residual_ms = 1e9;
+        if (relative_period_error) *relative_period_error = 1.0;
+        return initial_period;
+    }
     /* Align the beat grid to maxima within +/-10 ms, matching the native code. */
     for (phase = 0; phase < period; ++phase) {
         double score = 0.0;
-        for (beat = phase; beat < n; beat += period)
-            score += envelope[local_envelope_peak(envelope, n, beat)];
+        for (beat = 0; ; ++beat) {
+            double position = phase + beat * initial_period;
+            size_t center;
+            if (position >= n) break;
+            center = (size_t)llround(position);
+            if (center >= n) break;
+            score += envelope[local_envelope_peak(envelope, n, center)];
+        }
         if (score > best_score) { best_score = score; best_phase = phase; }
     }
 
-    for (beat = 0; (double)best_phase + beat * period < n; ++beat) {
-        size_t center = best_phase + beat * period;
+    for (beat = 0; (double)best_phase + beat * initial_period < n; ++beat) {
+        size_t center = (size_t)llround(best_phase + beat * initial_period);
+        if (center >= n) break;
         size_t peak = local_envelope_peak(envelope, n, center);
         if (envelope[peak] > 0.0) {
             double x = (double)beat, y = (double)peak;
@@ -475,11 +486,28 @@ static double fit_peak_period(const double *envelope, size_t n, double initial_p
     return slope > 0.0 ? slope : initial_period;
 }
 
+static double fit_peak_period(const double *envelope, size_t n, double initial_period,
+                              double *residual_ms, double *relative_period_error) {
+    double first_residual, first_error, second_residual, second_error;
+    double first = fit_peak_period_once(envelope, n, initial_period,
+                                        &first_residual, &first_error);
+    double second = fit_peak_period_once(envelope, n, first,
+                                         &second_residual, &second_error);
+    if (fabs(second - first) < 1.0 && second_residual <= first_residual + 0.5) {
+        if (residual_ms) *residual_ms = second_residual;
+        if (relative_period_error) *relative_period_error = second_error;
+        return second;
+    }
+    if (residual_ms) *residual_ms = first_residual;
+    if (relative_period_error) *relative_period_error = first_error;
+    return first;
+}
+
 static size_t best_autocorrelation_lag(const Complex *correlation, size_t n, size_t fft_n) {
     size_t lag, best = 0;
     double best_score = -1e300;
     /* Prefer a local peak supported by at least four harmonic peaks. */
-    for (lag = 200; lag <= 2000 && lag < n / 2; ++lag) {
+    for (lag = 180; lag <= 2000 && lag < n / 2; ++lag) {
         const double peak = correlation[lag].re;
         size_t neighbor, harmonic, hits = 0;
         double sum = 0.0, average;
@@ -520,7 +548,7 @@ static size_t best_autocorrelation_lag(const Complex *correlation, size_t n, siz
     }
     /* Sparse or short material falls back to the largest single peak. */
     if (!best) {
-        for (lag = 200; lag <= 2000 && lag < n / 2; ++lag) {
+        for (lag = 180; lag <= 2000 && lag < n / 2; ++lag) {
             if (correlation[lag].re > best_score) {
                 best_score = correlation[lag].re;
                 best = lag;
@@ -530,11 +558,86 @@ static size_t best_autocorrelation_lag(const Complex *correlation, size_t n, siz
     return best;
 }
 
+/* A chart can count a strong subdivision as its beat.  Keep the native
+ * autocorrelation choice as the anchor, then inspect nearby faster pulses.
+ * Only promote a subdivision when it has its own distinct, strong peak. */
+static size_t supported_subdivision_lag(const Complex *correlation, size_t lag) {
+    static const struct { double fraction, min_bpm, max_bpm, strength; } options[] = {
+        {0.5,       220.0, 270.0, 0.85},
+        {2.0 / 3.0, 270.0, 340.0, 0.70}
+    };
+    double anchor = correlation[lag].re;
+    size_t option;
+    if (anchor <= 0.0) return lag;
+    for (option = 0; option < sizeof(options) / sizeof(options[0]); ++option) {
+        size_t center = (size_t)llround(lag * options[option].fraction);
+        size_t candidate, best = 0;
+        double peak = 0.0, bpm;
+        if (center < 180) continue;
+        for (candidate = center - 4; candidate <= center + 4; ++candidate) {
+            double value = correlation[candidate].re;
+            if (value > peak && value >= correlation[candidate - 1].re &&
+                value >= correlation[candidate + 1].re) {
+                peak = value;
+                best = candidate;
+            }
+        }
+        if (!best || peak < anchor * options[option].strength) continue;
+        bpm = 60000.0 / best;
+        if (bpm >= options[option].min_bpm && bpm <= options[option].max_bpm)
+            return best;
+    }
+    return lag;
+}
+
+/* Several distant autocorrelation peaks resolve sub-millisecond periods more
+ * reliably than interpolating one broad peak in the filtered envelope. */
+static double harmonic_peak_period(const Complex *correlation, size_t n,
+                                   size_t lag, int *reliable) {
+    size_t harmonic, count = 0;
+    double sum_xy = 0.0, sum_xx = 0.0, sum_weight = 0.0, error = 0.0;
+    double positions[12], weights[12], indices[12], period;
+    size_t limit = n / 2 > 2000 ? 2000 : n / 2 - 1;
+    *reliable = 0;
+    for (harmonic = 1; harmonic <= 11 && harmonic * lag <= limit; ++harmonic) {
+        size_t center = harmonic * lag, first = center > 10 ? center - 10 : 1;
+        size_t last = center + 10, index, best = 0;
+        double peak = 0.0;
+        if (last > limit) last = limit;
+        for (index = first; index <= last; ++index) {
+            double value = correlation[index].re;
+            if (value > peak && value >= correlation[index - 1].re &&
+                value >= correlation[index + 1].re) {
+                peak = value;
+                best = index;
+            }
+        }
+        if (!best || peak < correlation[lag].re * 0.35) continue;
+        positions[count] = (double)best;
+        weights[count] = peak;
+        indices[count] = (double)harmonic;
+        sum_xy += peak * harmonic * best;
+        sum_xx += peak * harmonic * harmonic;
+        sum_weight += peak;
+        ++count;
+    }
+    if (count < 3 || sum_xx <= 0.0) return (double)lag;
+    period = sum_xy / sum_xx;
+    for (harmonic = 0; harmonic < count; ++harmonic) {
+        double expected = indices[harmonic] * period;
+        double difference = positions[harmonic] - expected;
+        error += weights[harmonic] * difference * difference;
+    }
+    *reliable = sqrt(error / sum_weight) <= 1.5;
+    return period;
+}
+
 static double estimate_bpm(const double *envelope, size_t n,
                            double *fit_residual, double *relative_error) {
     size_t fft_n = 1, index, lag;
     Complex *correlation;
-    double left, center, right, denominator, shift, period;
+    double left, center, right, denominator, shift, period, harmonic_period;
+    int harmonic_reliable;
     while (fft_n < n * 2) {
         if (fft_n > ((size_t)-1) / 2) return 0.0;
         fft_n <<= 1;
@@ -551,6 +654,8 @@ static double estimate_bpm(const double *envelope, size_t n,
     fft(correlation, fft_n, 1);
     lag = best_autocorrelation_lag(correlation, n, fft_n);
     if (!lag) { free(correlation); return 0.0; }
+    lag = supported_subdivision_lag(correlation, lag);
+    harmonic_period = harmonic_peak_period(correlation, n, lag, &harmonic_reliable);
 
     /* Parabolic interpolation gives a sub-millisecond starting period. */
     left = correlation[lag - 1].re;
@@ -558,9 +663,13 @@ static double estimate_bpm(const double *envelope, size_t n,
     right = correlation[lag + 1].re;
     denominator = left - 2.0 * center + right;
     shift = fabs(denominator) > 1e-20 ? 0.5 * (left - right) / denominator : 0.0;
-    period = lag + fmax(-0.5, fmin(0.5, shift));
+    period = harmonic_reliable ? harmonic_period :
+             lag + fmax(-0.5, fmin(0.5, shift));
     free(correlation);
-    period = fit_peak_period(envelope, n, period, fit_residual, relative_error);
+    {
+        double fitted = fit_peak_period(envelope, n, period, fit_residual, relative_error);
+        if (!harmonic_reliable || fabs(fitted - period) > 0.5) period = fitted;
+    }
     return 60000.0 / period;
 }
 
