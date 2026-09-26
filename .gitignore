@@ -3,6 +3,7 @@
 *.o
 *.obj
 /bpm
+/dist/
 
 # Local reverse-engineering workspace and downloaded tools
 /analysis/
