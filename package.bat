@@ -28,7 +28,7 @@ mkdir "%PACKAGE_DIR%"
 if errorlevel 1 goto :failed
 
 echo Compiling bpm.c with "%GCC%"...
-"%GCC%" -std=c11 -O2 -Wall -Wextra -Wpedantic -o "%PACKAGE_DIR%\bpm.exe" bpm.c -lm -lwinmm
+"%GCC%" -std=c11 -O2 -Wall -Wextra -Wpedantic -o "%PACKAGE_DIR%\bpm.exe" bpm.c -lm -lwinmm -lshell32
 if errorlevel 1 goto :failed
 
 copy /y README.md "%PACKAGE_DIR%\README.md" >nul

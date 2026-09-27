@@ -43,7 +43,7 @@ jobs:
         run: |
           mkdir -p dist/windows
           x86_64-w64-mingw32-gcc -std=c11 -O2 -Wall -Wextra -Wpedantic \
-            -o dist/windows/bpm.exe bpm.c -lm -lwinmm
+            -o dist/windows/bpm.exe bpm.c -lm -lwinmm -lshell32
           cp README.md dist/windows/README.md
           (cd dist/windows && zip -9 ../bpm-windows-x64.zip bpm.exe README.md)
 

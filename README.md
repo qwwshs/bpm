@@ -8,7 +8,7 @@ The source requires a C11 compiler and the platform's standard system libraries.
 
 ```sh
 # Windows (GCC / MinGW-w64)
-gcc -std=c11 -O2 -o bpm.exe bpm.c -lm -lwinmm
+gcc -std=c11 -O2 -o bpm.exe bpm.c -lm -lwinmm -lshell32
 
 # Or build the Windows release ZIP with the included batch file
 package.bat
@@ -21,6 +21,8 @@ cc -std=c11 -O2 -o bpm bpm.c -lm
 ```
 
 No third-party library is needed to build. Supported PCM WAV files can be analyzed directly. For MP3 and other unsupported formats, install `ffmpeg` and put it on `PATH`; the program will use it to decode to a temporary WAV file.
+
+On Windows, audio paths with Unicode characters are supported both on the command line and when entering a path in the TUI.
 
 On Windows, `package.bat` builds `dist/bpm-windows-x64.zip` containing `bpm.exe` and this README. It requires GCC (MinGW-w64 or MSYS2) and PowerShell, both available on standard Windows development setups.
 

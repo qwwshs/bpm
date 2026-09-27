@@ -3,7 +3,7 @@
 #endif
 /*
  * Standalone BPM and leading-silence analyser.
- * Build: Windows gcc -O2 bpm.c -lm -lwinmm -o bpm.exe
+ * Build: Windows gcc -O2 bpm.c -lm -lwinmm -lshell32 -o bpm.exe
  *        macOS/Linux cc -O2 bpm.c -lm -o bpm
  * Input: PCM WAV (8/16/24/32-bit integer or 32-bit IEEE float).
  */
@@ -16,6 +16,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <mmsystem.h>
+#include <shellapi.h>
 #else
 #include <unistd.h>
 #include <sys/wait.h>
@@ -80,8 +81,44 @@ typedef struct {
 static uint16_t u16le(const unsigned char *p) { return (uint16_t)(p[0] | ((uint16_t)p[1] << 8)); }
 static uint32_t u32le(const unsigned char *p) { return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24); }
 
+#ifdef _WIN32
+static wchar_t *wide_from_utf8(const char *text) {
+    int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text, -1, NULL, 0);
+    wchar_t *wide;
+    if (!length) return NULL;
+    wide = (wchar_t *)malloc((size_t)length * sizeof(wchar_t));
+    if (!wide || !MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                      text, -1, wide, length)) {
+        free(wide);
+        return NULL;
+    }
+    return wide;
+}
+
+static char *utf8_from_wide(const wchar_t *wide) {
+    int length = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                     wide, -1, NULL, 0, NULL, NULL);
+    char *text;
+    if (!length) return NULL;
+    text = (char *)malloc((size_t)length);
+    if (!text || !WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                      wide, -1, text, length, NULL, NULL)) {
+        free(text);
+        return NULL;
+    }
+    return text;
+}
+#endif
+
 static int read_wave(const char *path, Wave *w) {
-    FILE *f = fopen(path, "rb");
+    FILE *f;
+#ifdef _WIN32
+    wchar_t *wide_path = wide_from_utf8(path);
+    f = wide_path ? _wfopen(wide_path, L"rb") : NULL;
+    free(wide_path);
+#else
+    f = fopen(path, "rb");
+#endif
     unsigned char head[12], ch[8];
     int have_fmt = 0, have_data = 0;
     memset(w, 0, sizeof(*w));
@@ -115,56 +152,80 @@ static int read_wave(const char *path, Wave *w) {
     return 1;
 }
 
+#ifdef _WIN32
+static int append_command_char(wchar_t *command, size_t capacity,
+                               size_t *length, wchar_t value) {
+    if (*length + 1 >= capacity) return 0;
+    command[(*length)++] = value;
+    command[*length] = L'\0';
+    return 1;
+}
+
+/* CreateProcessW expects the executable's usual Windows argument quoting. */
+static int append_quoted_argument(wchar_t *command, size_t capacity,
+                                  size_t *length, const wchar_t *argument) {
+    if (!append_command_char(command, capacity, length, L'"')) return 0;
+    while (*argument) {
+        size_t slashes = 0, copies;
+        while (*argument == L'\\') { ++slashes; ++argument; }
+        copies = *argument == L'"' || !*argument ? slashes * 2 : slashes;
+        if (*argument == L'"') ++copies;
+        while (copies--)
+            if (!append_command_char(command, capacity, length, L'\\')) return 0;
+        if (!*argument) break;
+        if (!append_command_char(command, capacity, length, *argument++)) return 0;
+    }
+    return append_command_char(command, capacity, length, L'"') &&
+           append_command_char(command, capacity, length, L' ');
+}
+#endif
+
 /* Ask ffmpeg to decode anything this small WAV reader cannot handle. */
 static int ffmpeg_decode(const char *input, char *output, size_t output_cap) {
 #ifdef _WIN32
-    char temp_dir[MAX_PATH], temp_path[MAX_PATH], command[32768];
-    STARTUPINFOA si; PROCESS_INFORMATION pi; size_t pos = 0;
-    DWORD n = GetTempPathA(MAX_PATH, temp_dir);
-    if (!n || n >= MAX_PATH || !GetTempFileNameA(temp_dir, "bpm", 0, temp_path)) return 0;
-    if (strlen(temp_path) + 1 > output_cap) { DeleteFileA(temp_path); return 0; }
-    strcpy(output, temp_path);
-    /* Quote every argument using the Windows command-line escaping rules. */
-    command[0] = '\0';
-    {
-        const char *args[13] = { "ffmpeg", "-nostdin", "-v", "error", "-y", "-i", input,
-                                 "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le" };
-        size_t i;
-        for (i = 0; i < 13; ++i) {
-            const char *p = args[i]; size_t slashes = 0;
-            if (pos + 3 >= sizeof(command)) goto fail_win;
-            command[pos++] = '"';
-            while (*p) {
-                if (*p == '\\') { ++slashes; ++p; continue; }
-                if (*p == '"') { while (slashes--) { command[pos++] = '\\'; command[pos++] = '\\'; } command[pos++] = '\\'; command[pos++] = '"'; }
-                else { while (slashes--) { command[pos++] = '\\'; } command[pos++] = *p; }
-                slashes = 0; ++p;
-                if (pos + 4 >= sizeof(command)) goto fail_win;
-            }
-            while (slashes--) { command[pos++] = '\\'; command[pos++] = '\\'; }
-            command[pos++] = '"'; command[pos++] = ' ';
-        }
-        command[pos] = '\0';
-        /* The WAV muxer is explicit because the temporary file has no .wav suffix. */
-        {
-            const char *tail[3] = { "-f", "wav", output };
-            for (i = 0; i < 3; ++i) {
-                const char *p = tail[i]; command[pos++] = '"';
-                while (*p && pos + 4 < sizeof(command)) {
-                    if (*p == '"') command[pos++] = '\\';
-                    command[pos++] = *p++;
-                }
-                command[pos++] = '"'; command[pos++] = ' ';
-            }
-            command[pos] = '\0';
-        }
+    wchar_t temp_dir[MAX_PATH], temp_path[MAX_PATH], command[32768];
+    wchar_t *wide_input = wide_from_utf8(input);
+    char *utf8_temp = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    size_t pos = 0, i;
+    DWORD n;
+    const wchar_t *args[] = {
+        L"ffmpeg", L"-nostdin", L"-v", L"error", L"-y", L"-i", wide_input,
+        L"-ac", L"2", L"-ar", L"44100", L"-c:a", L"pcm_s16le",
+        L"-f", L"wav", temp_path
+    };
+    output[0] = '\0';
+    if (!wide_input) return 0;
+    n = GetTempPathW(MAX_PATH, temp_dir);
+    if (!n || n >= MAX_PATH || !GetTempFileNameW(temp_dir, L"bpm", 0, temp_path)) {
+        free(wide_input);
+        return 0;
     }
+    utf8_temp = utf8_from_wide(temp_path);
+    if (!utf8_temp || strlen(utf8_temp) + 1 > output_cap) goto fail_win;
+    strcpy(output, utf8_temp);
+    command[0] = L'\0';
+    for (i = 0; i < sizeof(args) / sizeof(args[0]); ++i)
+        if (!append_quoted_argument(command, sizeof(command) / sizeof(command[0]),
+                                    &pos, args[i])) goto fail_win;
     memset(&si, 0, sizeof(si)); memset(&pi, 0, sizeof(pi)); si.cb = sizeof(si); si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_HIDE;
-    if (!CreateProcessA(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) goto fail_win;
+    if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) goto fail_win;
     WaitForSingleObject(pi.hProcess, INFINITE);
-    { DWORD code = 1; GetExitCodeProcess(pi.hProcess, &code); CloseHandle(pi.hThread); CloseHandle(pi.hProcess); if (code == 0) return 1; }
+    {
+        DWORD code = 1;
+        GetExitCodeProcess(pi.hProcess, &code);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        if (code == 0) { free(wide_input); free(utf8_temp); return 1; }
+    }
 fail_win:
-    DeleteFileA(temp_path); output[0] = '\0'; return 0;
+    DeleteFileW(temp_path);
+    output[0] = '\0';
+    free(wide_input);
+    free(utf8_temp);
+    return 0;
 #else
     char template[] = "/tmp/bpm-audio-XXXXXX";
     int fd = mkstemp(template), status;
@@ -187,7 +248,11 @@ fail_win:
 
 static void remove_temp(const char *path) {
 #ifdef _WIN32
-    if (path && *path) DeleteFileA(path);
+    if (path && *path) {
+        wchar_t *wide_path = wide_from_utf8(path);
+        if (wide_path) DeleteFileW(wide_path);
+        free(wide_path);
+    }
 #else
     if (path && *path) unlink(path);
 #endif
@@ -1433,7 +1498,7 @@ static int run_tui(Wave *w, const char *name) {
 }
 #endif
 
-int main(int argc, char **argv) {
+static int bpm_main(int argc, char **argv) {
     Wave w; size_t n; double offset, *env, bpm, fit_residual=1e9, relative_error=1.0, bpm_error;
     int show_offset = 0, tui = 0, i, loaded = 0;
     const char *input = NULL;
@@ -1458,7 +1523,27 @@ int main(int argc, char **argv) {
     if (!input && tui) {
         static char pathbuf[4096];
         printf("Enter audio file path: "); fflush(stdout);
+#ifdef _WIN32
+        {
+            HANDLE console = GetStdHandle(STD_INPUT_HANDLE);
+            DWORD mode, count;
+            if (GetConsoleMode(console, &mode)) {
+                wchar_t wide_path[4096];
+                char *utf8_path;
+                if (!ReadConsoleW(console, wide_path, 4095, &count, NULL)) return 2;
+                wide_path[count] = L'\0';
+                utf8_path = utf8_from_wide(wide_path);
+                if (!utf8_path || strlen(utf8_path) >= sizeof(pathbuf)) {
+                    free(utf8_path);
+                    return 2;
+                }
+                strcpy(pathbuf, utf8_path);
+                free(utf8_path);
+            } else if (!fgets(pathbuf, sizeof(pathbuf), stdin)) return 2;
+        }
+#else
         if (!fgets(pathbuf, sizeof(pathbuf), stdin)) return 2;
+#endif
         pathbuf[strcspn(pathbuf,"\r\n")]=0;
         if(pathbuf[0]=='"'){size_t len=strlen(pathbuf);if(len>1&&pathbuf[len-1]=='"'){pathbuf[len-1]=0;memmove(pathbuf,pathbuf+1,len-1);}}
         if(!pathbuf[0])return 2;
@@ -1471,7 +1556,7 @@ int main(int argc, char **argv) {
         if (ffmpeg_decode(input, temp_path, sizeof(temp_path))) loaded = read_wave(temp_path, &w);
         if (!loaded) {
             remove_temp(temp_path);
-            fprintf(stderr, "Error: cannot read this audio; install ffmpeg and ensure it is on PATH.\n");
+            fprintf(stderr, "Error: cannot read this audio; check the path and ffmpeg availability.\n");
             return 2;
         }
     }
@@ -1498,3 +1583,30 @@ int main(int argc, char **argv) {
         printf("Warning: BPM varies or the fit is unstable; this result may be inaccurate.\n");
     free(env); return 0;
 }
+
+#ifdef _WIN32
+int main(void) {
+    int argc, i, result;
+    LPWSTR *wide_argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    char **argv;
+    if (!wide_argv) return 2;
+    argv = (char **)calloc((size_t)argc + 1, sizeof(char *));
+    if (!argv) { LocalFree(wide_argv); return 2; }
+    for (i = 0; i < argc; ++i) {
+        argv[i] = utf8_from_wide(wide_argv[i]);
+        if (!argv[i]) {
+            while (i-- > 0) free(argv[i]);
+            free(argv);
+            LocalFree(wide_argv);
+            return 2;
+        }
+    }
+    LocalFree(wide_argv);
+    result = bpm_main(argc, argv);
+    for (i = 0; i < argc; ++i) free(argv[i]);
+    free(argv);
+    return result;
+}
+#else
+int main(int argc, char **argv) { return bpm_main(argc, argv); }
+#endif
